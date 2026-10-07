@@ -9,8 +9,8 @@
 // generic "tool" node instead of breaking the graph.
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { normalizeTurns, type Row } from "./timeline";
-import { GRAPH_CHANGED, type GraphChangedPayload } from "./shared";
+import { normalizeTurns, type Row } from "./timeline.ts";
+import { GRAPH_CHANGED, type GraphChangedPayload } from "./shared.ts";
 
 const nodeKindSchema = z.enum([
   "root",
@@ -78,6 +78,10 @@ type ThreadDto = {
   updatedAt: number;
   createdAt: number;
   hasPendingInteraction?: boolean;
+  /** Present on thread lists. */
+  activity?: { activeBackgroundAgentCount?: number } | null;
+  /** Present on a single thread. */
+  activeBackgroundAgentCount?: number;
   queuedWork?: string;
   environmentBranchName?: string | null;
   runtime?: { displayStatus?: string } | null;
@@ -144,10 +148,24 @@ function rowStatus(row: Row, threadRunning: boolean): NodeStatus {
   }
 }
 
+/** Background agents bb counts as still working for this thread. */
+export function backgroundAgents(thread: ThreadDto): number {
+  return (
+    thread.activity?.activeBackgroundAgentCount ??
+    thread.activeBackgroundAgentCount ??
+    0
+  );
+}
+
+/** A background delegation's own output is only the launch receipt. */
+const LAUNCH_RECEIPT = /^(async agent launched|started subagent)\b/i;
+
 function threadStatus(thread: ThreadDto): NodeStatus {
   if (thread.hasPendingInteraction) return "waiting";
   if (thread.status === "error") return "error";
   if (RUNNING_THREAD_STATUSES.has(thread.status)) return "running";
+  // Between turns, background agents may still be working.
+  if (backgroundAgents(thread) > 0) return "running";
   if (thread.queuedWork !== undefined && thread.queuedWork !== "none")
     return "queued";
   return "idle";
@@ -206,12 +224,15 @@ function workLabel(row: Row): { label: string; sublabel: string | null } {
   }
 }
 
-class GraphBuilder {
+export class GraphBuilder {
   nodes: GraphNode[] = [];
   truncated = false;
 
   /** Newest work rows kept per turn or subagent; older ones fold into "+N". */
-  constructor(private readonly workLimit = MAX_WORK_PER_TURN) {}
+  private readonly workLimit: number;
+  constructor(workLimit = MAX_WORK_PER_TURN) {
+    this.workLimit = workLimit;
+  }
 
   add(node: Omit<GraphNode, "meta"> & { meta?: Record<string, string> }) {
     if (this.nodes.length >= MAX_NODES) {
@@ -228,6 +249,7 @@ class GraphBuilder {
     parentId: string,
     threadId: string,
     threadRunning: boolean,
+    backgroundLive = false,
   ) {
     const work = rows.filter((row) => row.kind === "work");
     // Subagents and workflows always stay visible; plain tool calls keep
@@ -264,21 +286,30 @@ class GraphBuilder {
         // Between tool calls a background subagent has no pending child;
         // it is still working until it hands back (Claude Code's
         // SubagentHandback) or the parent thread stops.
-        const handback = childWork.find(
-          (child) => child.toolName === "SubagentHandback",
-        );
+        // The newest handback wins: an agent woken again hands back again.
+        const handback = [...childWork]
+          .reverse()
+          .find((child) => child.toolName === "SubagentHandback");
         const handedBack = handback !== undefined;
         const handbackArgs = (handback?.toolArgs ?? null) as Row | null;
         // A background delegation's own output is just the launch receipt;
         // the subagent's real answer is its handback message.
+        const output = str(row.output);
         const report =
           str(handbackArgs?.message) ??
-          (row.background === true ? null : str(row.output));
+          (row.background !== true
+            ? output
+            : row.status !== "pending" && output !== null && !LAUNCH_RECEIPT.test(output)
+              ? output
+              : null);
         const childRunning =
           childWork.some(
             (child) => rowStatus(child, threadRunning) === "running",
           ) ||
-          (row.background === true && threadRunning && !handedBack);
+          (row.background === true && threadRunning && !handedBack) ||
+          // Between turns: still working while bb counts the thread's
+          // background agents and this one has not handed back.
+          (row.background === true && backgroundLive && !handedBack);
         const childRef = str(row.childRef);
         const ok = this.add({
           ...base,
@@ -303,7 +334,7 @@ class GraphBuilder {
             ...(lastChild ? { "last step": workLabel(lastChild).label } : {}),
           },
         });
-        if (ok) this.addWork(childRows, id, threadId, threadRunning);
+        if (ok) this.addWork(childRows, id, threadId, threadRunning, backgroundLive);
         return;
       }
       if (row.workKind === "workflow") {
@@ -401,6 +432,7 @@ class GraphBuilder {
     threadId: string,
     threadRunning: boolean,
     turnLimit: number,
+    backgroundLive = false,
   ) {
     // Drop turns with nothing to show (no prompt, steps or reply), such as
     // bookkeeping turns, unless they are still live.
@@ -453,7 +485,7 @@ class GraphBuilder {
         output: clip(str(reply?.text), TEXT_CAP),
         meta: last ? { "last step": workLabel(last).label } : {},
       });
-      if (ok) this.addWork(children, id, threadId, threadRunning);
+      if (ok) this.addWork(children, id, threadId, threadRunning, backgroundLive);
     });
   }
 }
@@ -625,6 +657,7 @@ export default async function plugin(bb: BbPluginApi) {
         thread.id,
         RUNNING_THREAD_STATUSES.has(thread.status),
         turns,
+        backgroundAgents(thread) > 0,
       );
     });
   }
